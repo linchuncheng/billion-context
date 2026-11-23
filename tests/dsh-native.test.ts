@@ -1363,7 +1363,10 @@ test("#3354/#3662 apply(): declares lane ownership instead of registering the ov
             // pins the transform + service side).
             assert.ok(isDshCompactionActive(), "active plan must declare the lane owned");
             assert.ok(!ctx.registrationOrder().some((e) => e.startsWith("on:internal/config")));
-            assert.equal(ctx.providedServices.length, 0);
+            // featured-plugins ecosystem entry (community dsh-featured): the
+            // only service this module provides, on top of the verdict-only
+            // #3662 lane declaration above.
+            assert.deepEqual(ctx.providedServices.map((s) => s.name), ["featured-plugins"]);
             await _stateToolsReadyForTest();
         });
     } finally {

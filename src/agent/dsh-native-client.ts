@@ -532,6 +532,13 @@ const zh: Dict = {
     "probe_error": "连接 bili 代理失败——最近一次探测报出的错误（可复制，便于反馈）：",
     "copy": "复制",
     "copied": "已复制",
+    "featured_tab": "精选插件",
+    "featured_welcome": "精选插件完整版（dsh-featured）未安装。",
+    "featured_install": "安装完整版",
+    "featured_installing": "正在安装完整版…",
+    "featured_installed": "已安装，刷新后即可使用完整功能。",
+    "featured_installed_short": "已安装",
+    "featured_desc": "一个入口逛完社区精选的好插件：搜索、标签筛选、一键安装、README 详情。",
 };
 
 const en: Dict = {
@@ -561,6 +568,13 @@ const en: Dict = {
     "probe_error": "Failed to reach the bili proxy — last probe error (copyable for reporting):",
     "copy": "Copy",
     "copied": "Copied",
+    "featured_tab": "Featured plugins",
+    "featured_welcome": "The full Featured plugins module (dsh-featured) is not installed.",
+    "featured_install": "Install the full version",
+    "featured_installing": "Installing…",
+    "featured_installed": "Installed — refresh to get the full experience.",
+    "featured_installed_short": "Installed",
+    "featured_desc": "One tab for community-curated plugins: search, tag filters, one-click install and README details.",
 };
 
 function readOrigin(): string | undefined {
@@ -744,6 +758,94 @@ function probeOrigin(onOrigin: (origin: string) => void, onTheme?: (theme: "ligh
     return () => {
         cancelled = true;
         if (timer !== undefined) clearTimeout(timer);
+    };
+}
+
+// Featured-plugins ecosystem entry (community dsh-featured), browser half.
+// Renders a lightweight "Featured plugins" tab ONLY while the full module
+// (dsh-featured) is not installed — one-click install via the host-provided
+// `install` prop; when the full version is already loaded it yields so the
+// profile never shows two featured tabs regardless of activation order.
+// ENTRY ONLY, by contract: curated-list membership is decided by the skillpie.cn
+// inclusion flow, never by this wiring.
+// https://github.com/skillpie/dsh-plugins/blob/main/dsh-featured/AI-INTEGRATION.md
+const FEATURED_FULL_PKG = "dsh-featured";
+
+function installFeaturedEntry(ctx: ClientContext, t: (key: string) => string): () => void {
+    if (typeof globalThis === "undefined") return () => {};
+    const w = globalThis as { __DSH_FEATURED_APPLIED__?: boolean; __DSH_FEATURED_FULL__?: boolean };
+    if (w.__DSH_FEATURED_APPLIED__) return () => {};
+    w.__DSH_FEATURED_APPLIED__ = true;
+    if (w.__DSH_FEATURED_FULL__) {
+        // Full dsh-featured module already loaded: yield so exactly one
+        // featured tab exists.
+        return () => {
+            w.__DSH_FEATURED_APPLIED__ = false;
+        };
+    }
+    const featuredSection = (props: Record<string, unknown>): unknown => {
+        const install = props.install;
+        const [st, setSt] = useState<"idle" | "running" | "installed">("idle");
+        const openInstall = (): void => {
+            if (st !== "idle" || typeof install !== "function") return;
+            setSt("running");
+            try {
+                (install as (options: { spec: string; title: string; version: string }) => unknown)({ spec: FEATURED_FULL_PKG, title: t("featured_tab"), version: "" });
+                setSt("installed");
+            } catch {
+                setSt("installed");
+            }
+        };
+        useEffect(() => {
+            if (st !== "idle") return;
+            if (typeof install !== "function") {
+                setSt("installed");
+                return;
+            }
+            setSt("running");
+            try {
+                (install as (options: { spec: string; title: string; version: string }) => unknown)({ spec: FEATURED_FULL_PKG, title: t("featured_tab"), version: "" });
+                setSt("installed");
+            } catch {
+                setSt("installed");
+            }
+        }, [st, install]);
+        const label = st === "running" ? t("featured_installing") : st === "installed" ? t("featured_installed_short") : t("featured_install");
+        return createElement(
+            "div",
+            { style: { padding: "24px 16px", maxWidth: 560, display: "flex", flexDirection: "column", gap: 12 } },
+            createElement("p", { style: { fontSize: 13, lineHeight: 1.7, margin: 0, opacity: 0.75 } }, t("featured_desc")),
+            st === "idle" ? createElement("p", { style: { fontSize: 13, lineHeight: 1.7, margin: 0 } }, t("featured_welcome")) : null,
+            createElement(
+                "button",
+                {
+                    type: "button",
+                    style: {
+                        alignSelf: "flex-start",
+                        cursor: st === "installed" ? "default" : "pointer",
+                        font: "inherit",
+                        fontSize: 13,
+                        fontWeight: 500,
+                        padding: "7px 16px",
+                        borderRadius: 8,
+                        border: "1px solid rgba(127,127,127,.35)",
+                        background: "#4f6ef7",
+                        color: "#fff",
+                        opacity: st === "installed" ? 0.6 : 1,
+                    },
+                    disabled: st === "installed",
+                    onClick: openInstall,
+                },
+                label,
+            ),
+        );
+    };
+    ctx.slots.inject(
+        "plugins.tab",
+        () => ctx.slots.register({ name: "plugins.tab", id: "bili-featured", order: 100, label: () => t("featured_tab"), locale: NS }, featuredSection),
+    );
+    return () => {
+        w.__DSH_FEATURED_APPLIED__ = false;
     };
 }
 
@@ -1172,4 +1274,8 @@ export function apply(ctx: ClientContext): void {
         "shell.overlay",
         () => ctx.slots.register({ name: "shell.overlay", id: "bili-upstreams", order: 100, label: () => t("upstreams_label"), locale: NS }, upstreamBanner()),
     );
+    // Featured-plugins ecosystem entry (community dsh-featured): entry-only
+    // tab while the full module is absent, yields once it is installed.
+    // Disposal clears the applied-guard so deactivate/reactivate re-arms.
+    ctx.effect(() => installFeaturedEntry(ctx, t), "bili: featured-plugins entry");
 }

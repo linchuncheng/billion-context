@@ -664,8 +664,10 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
 
     const m = await mountClient(extra);
     assert.deepEqual(Array.from(m.inject), ["slots", "locale"]);
-    assert.deepEqual(m.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view", "shell.overlay"]);
-    assert.equal(m.optionsBySlot.size, 4);
+    // "plugins.tab" is the featured-plugins ecosystem entry (community
+    // dsh-featured): entry-only tab that yields once the full module loads.
+    assert.deepEqual(m.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view", "shell.overlay", "plugins.tab"]);
+    assert.equal(m.optionsBySlot.size, 5);
     // #3862: the per-session Context tab sits right of the built-in chat (0) /
     // trajectory (10) faces and any third-party context tab (dsh-context: 20).
     const viewSlot = m.optionsBySlot.get("conversation.view")!;
@@ -2012,8 +2014,10 @@ test("#4237: contextTab=false hides the Context tab; absent field fails open to 
     const hidden = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTab: false } });
     // #4254: the shell.overlay availability pill is NOT user-hidable — it rides along
     // even when the Context tab is hidden (it is an error surface, not a preference).
-    assert.deepEqual(hidden.slotsOrder, ["settings.section", "plugins.bundle.config", "shell.overlay"]);
-    assert.equal(hidden.optionsBySlot.size, 3);
+    // "plugins.tab" (featured-plugins ecosystem entry, community dsh-featured)
+    // is not user-hidable either — it yields only when the full module loads.
+    assert.deepEqual(hidden.slotsOrder, ["settings.section", "plugins.bundle.config", "shell.overlay", "plugins.tab"]);
+    assert.equal(hidden.optionsBySlot.size, 4);
     assert.ok(!hidden.optionsBySlot.has("conversation.view"), "hidden tab registers nothing");
     assert.ok(hidden.optionsBySlot.has("shell.overlay"), "the #4254 pill stays registered");
     hidden.runCleanups();
@@ -2024,7 +2028,7 @@ test("#4237: contextTab=false hides the Context tab; absent field fails open to 
     // explicit on keeps it; (absent-field fail-open is pinned by the #1590/#2125
     // and #3862 tests above, which mount without the field).
     const shown = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTab: true } });
-    assert.deepEqual(shown.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view", "shell.overlay"]);
+    assert.deepEqual(shown.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view", "shell.overlay", "plugins.tab"]);
     shown.runCleanups();
 });
 

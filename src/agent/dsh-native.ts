@@ -3118,6 +3118,18 @@ export async function apply(ctx: PluginContext): Promise<void> {
     // globalThis.fetch/WebSocket from inside a test run.
     if (process.env.NODE_TEST_CONTEXT === undefined) installDshIntercepts(state);
 
+    // Featured-plugins ecosystem entry (community dsh-featured): registers
+    // this package as a recommendation source and, when this activation is
+    // the first featured-integrated plugin in the profile, hosts the
+    // aggregate route. ENTRY ONLY — curated-list membership is decided by the
+    // skillpie.cn inclusion flow, never by this wiring. Fail-open by
+    // contract: any error here must never break the compression lane.
+    try {
+        integrateFeaturedPlugins(ctx, FEATURED_SOURCE);
+    } catch (error) {
+        console.error("[billion-context] featured-plugins integration failed; continuing", error);
+    }
+
     // #4134: hold activation until the ACP tool registration has landed (or
     // is provably not coming / 2s cap). The host composes each model round
     // from the CURRENTLY registered tool set, so a fire-and-forget
@@ -3354,4 +3366,314 @@ export function _setModelInfoForTest(entry?: { provider: string; model: string; 
         return;
     }
     modelInfo.byKey.set(modelInfoKey(entry.provider, entry.model), { provider: entry.provider, model: entry.model, contextWindow: entry.contextWindow });
+}
+
+/* ── Featured-plugins ecosystem entry (community dsh-featured) ───────────────
+ * Registers THIS package as a recommendation source for the shared cross-plugin
+ * service `featured-plugins`, and — when this activation is the FIRST
+ * featured-integrated plugin in the profile — hosts the aggregate route
+ * GET /dsh-plugins-plugin/featured (remote curated catalog + locally registered
+ * sources + installed-version badges). Purpose: the official plugins page gets a
+ * lightweight "Featured plugins" tab pointing at dsh-featured, so users without
+ * the full module get a one-click install path while the full module takes the
+ * tab over when installed.
+ * ENTRY ONLY, by contract: whether a plugin appears in the curated list is
+ * decided by the skillpie.cn inclusion flow, never by this wiring — FEATURED_SOURCE
+ * entries recommends OTHER plugins and stays empty here. Integration contract:
+ * https://github.com/skillpie/dsh-plugins/blob/main/dsh-featured/AI-INTEGRATION.md */
+
+const FEATURED_ROUTE = "/dsh-plugins-plugin/featured";
+const FEATURED_SERVICE = "featured-plugins";
+const FEATURED_SOURCE = { id: "billion-context", title: "billion-context", entries: [] as Array<{ package: string; title: string }> };
+
+type FeaturedPluginEntry = {
+    package: string;
+    title: string;
+    source: string;
+    description?: string;
+    version?: string;
+    icon?: string;
+    homepage?: string;
+    author?: string;
+    category?: string;
+    screenshots?: string[];
+    stars?: number;
+    downloads?: number;
+    tags?: string[];
+};
+
+type FeaturedPluginSource = { id: string; title: string; entries: FeaturedPluginEntry[] };
+
+type FeaturedRegistry = {
+    register: (source: FeaturedPluginSource) => () => void;
+    list: () => FeaturedPluginSource[];
+};
+
+// Minimal shape of the (possibly partial) host context the featured wiring
+// needs. apply() passes its own PluginContext through a widening cast: hosts
+// without a member are detected at runtime and degrade gracefully.
+type FeaturedHostContext = {
+    get?: (name: string) => unknown;
+    reflect?: { provide?: (name: string, value: unknown) => void };
+    effect?: (fn: () => void | (() => void), label?: string) => void;
+    inject?: (deps: readonly string[], callback: (child: FeaturedHostChildContext) => void) => unknown;
+};
+
+type FeaturedHostChildContext = {
+    effect?: (fn: () => void | (() => void), label?: string) => void;
+    webServer?: PluginContext["webServer"];
+    pluginManager?: {
+        listBundles?: () => Promise<Array<{ name?: unknown; version?: unknown; installed?: unknown }>>;
+    };
+};
+
+function featuredNormalizeEntry(raw: unknown, sourceId: string): FeaturedPluginEntry | null {
+    if (!raw || typeof raw !== "object") return null;
+    const rec = raw as Record<string, unknown>;
+    const pkg = String(rec.package ?? rec.name ?? "").trim();
+    const title = String(rec.title ?? "").trim();
+    if (!pkg || !title) return null;
+    const entry: FeaturedPluginEntry = { package: pkg, title, source: sourceId };
+    for (const key of ["description", "version", "icon", "homepage", "author", "category"] as const) {
+        const value = String(rec[key] ?? "").trim();
+        if (value) (entry as Record<string, unknown>)[key] = value;
+    }
+    if (Array.isArray(rec.screenshots)) {
+        const shots = rec.screenshots.map((s) => String(s).trim()).filter(Boolean).slice(0, 4);
+        if (shots.length) entry.screenshots = shots;
+    }
+    if (typeof rec.stars === "number" && rec.stars >= 0) entry.stars = rec.stars;
+    if (typeof rec.downloads === "number" && rec.downloads >= 0) entry.downloads = rec.downloads;
+    if (Array.isArray(rec.tags)) {
+        const tags = rec.tags.map((t) => String(t).trim()).filter(Boolean).slice(0, 8);
+        if (tags.length) entry.tags = tags;
+    }
+    return entry;
+}
+
+function featuredNormalizeSource(raw: unknown): FeaturedPluginSource {
+    if (!raw || typeof raw !== "object") throw new Error("featured source must be an object");
+    const rec = raw as Record<string, unknown>;
+    const id = String(rec.id ?? "").trim();
+    if (!id) throw new Error("featured source needs an id (the integrating package name)");
+    const title = String(rec.title ?? id).trim();
+    const rawEntries = Array.isArray(rec.entries) ? rec.entries : [];
+    const entries: FeaturedPluginEntry[] = [];
+    for (const item of rawEntries) {
+        const entry = featuredNormalizeEntry(item, id);
+        if (entry) entries.push(entry);
+    }
+    return { id, title, entries };
+}
+
+function featuredJson(res: { writeHead: (status: number, headers?: Record<string, string>) => void; end: (body?: string) => void }, code: number, obj: unknown): void {
+    res.writeHead(code, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+    res.end(JSON.stringify(obj));
+}
+
+// Same-origin check: browsers always send Origin; curl (owner role) may omit
+// it and is allowed through.
+function featuredSameOrigin(req: unknown, headers: Record<string, unknown>): boolean {
+    const origin = (req as { headers?: Record<string, unknown> })?.headers?.origin;
+    if (!origin || typeof origin !== "string") return true;
+    try {
+        return new URL(origin).host === String(headers.host ?? "");
+    } catch {
+        return false;
+    }
+}
+
+// Local registry creation is shared between "already provided by an earlier
+// featured-integrated plugin" (lookup via ctx.get) and "we are first" (we
+// provide it).
+function featuredCreateRegistry(): FeaturedRegistry {
+    const sources = new Map<string, FeaturedPluginSource>();
+    return {
+        register(source: FeaturedPluginSource) {
+            sources.set(source.id, source);
+            return () => {
+                if (sources.get(source.id) === source) sources.delete(source.id);
+            };
+        },
+        list() {
+            return [...sources.values()];
+        },
+    };
+}
+
+function integrateFeaturedPlugins(pluginCtx: PluginContext, source: { id: string; title: string; entries: Array<{ package: string; title: string }> }): void {
+    const ctx = pluginCtx as unknown as FeaturedHostContext;
+    // ── cross-plugin registry service: first activation owns it ──
+    let owner = false;
+    let registry: FeaturedRegistry | null = null;
+    try {
+        const existing = typeof ctx.get === "function" ? ctx.get(FEATURED_SERVICE) : undefined;
+        if (existing && typeof (existing as FeaturedRegistry).register === "function") registry = existing as FeaturedRegistry;
+    } catch { /* get unavailable → treat as not provided */ }
+    if (!registry) {
+        registry = featuredCreateRegistry();
+        if (typeof ctx.reflect?.provide === "function") {
+            ctx.reflect.provide(FEATURED_SERVICE, registry);
+            owner = true;
+        }
+    }
+
+    // Register this package's recommendation source; disposal via ctx.effect
+    // when the host supports it.
+    const normalizedSource = featuredNormalizeSource(source);
+    const unregister = registry.register(normalizedSource);
+    if (typeof ctx.effect === "function") {
+        ctx.effect(unregister, "billion-context: featured-plugins source");
+    }
+
+    if (!owner) return; // non-owner: contributes data only
+
+    // ── owner duties: remote curated catalog (5-min in-memory cache) ──
+    const REMOTE_CATALOG_URLS = [
+        "https://cdn.jsdelivr.net/gh/skillpie/dsh-plugins@main/dsh-plugins-plugin/plugins.json",
+        "https://raw.githubusercontent.com/skillpie/dsh-plugins/main/dsh-plugins-plugin/plugins.json",
+    ];
+    const REMOTE_TTL_MS = 5 * 60_000;
+    let remoteCache: { at: number; doc: { entries?: unknown; updated?: string } | null } = { at: 0, doc: null };
+
+    // Concurrent multi-source fetch, keep the NEWEST doc. "First response wins"
+    // lets a stale jsdelivr CDN copy shadow fresh data for hours. Freshness is
+    // decided by three signals (highest priority first): the repo-written
+    // `updated` timestamp, the entry count (plugins.json only grows), and the
+    // version-number sum (same-count upgrades only differ here — the enrich
+    // script writes `updated` per-day, so same-day pushes need the tiebreak).
+    const catalogScore = (doc: { entries?: unknown; updated?: string } | null): { at: number; count: number; versions: number } => {
+        const at = Date.parse(String(doc?.updated ?? ""));
+        const entries = Array.isArray(doc?.entries) ? (doc.entries as Array<Record<string, unknown>>) : [];
+        let versions = 0;
+        for (const e of entries) {
+            const parts = String(e?.version ?? "0.0.0").split(".").map((n) => Number.parseInt(n, 10) || 0);
+            versions += (parts[0] || 0) * 1_000_000 + (parts[1] || 0) * 1_000 + (parts[2] || 0);
+        }
+        return { at: Number.isFinite(at) ? at : 0, count: entries.length, versions };
+    };
+    const newerCatalog = (a: { at: number; count: number; versions: number }, b: { at: number; count: number; versions: number }): boolean => {
+        if (a.at !== b.at) return a.at > b.at;
+        if (a.count !== b.count) return a.count > b.count;
+        return a.versions > b.versions;
+    };
+    async function fetchRemoteCatalog(): Promise<{ entries?: unknown; updated?: string } | null> {
+        const now = Date.now();
+        if (remoteCache.doc && now - remoteCache.at < REMOTE_TTL_MS) return remoteCache.doc;
+        const results = await Promise.all(
+            REMOTE_CATALOG_URLS.map(async (url): Promise<{ entries?: unknown; updated?: string } | null> => {
+                try {
+                    const res = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(8000) });
+                    if (!res.ok) return null;
+                    const doc = (await res.json()) as { entries?: unknown; updated?: string };
+                    return Array.isArray(doc?.entries) ? doc : null;
+                } catch {
+                    return null;
+                }
+            }),
+        );
+        const docs = results.filter((doc): doc is { entries?: unknown; updated?: string } => doc !== null);
+        if (docs.length === 0) return null;
+        // Three-signal comparison; full tie keeps the concurrent-order front
+        // (jsdelivr first).
+        const best = docs.reduce((a, b) => (newerCatalog(catalogScore(b), catalogScore(a)) ? b : a));
+        remoteCache = { at: now, doc: best };
+        return best;
+    }
+
+    // ── installed-badges: poll pluginManager on an isolated inject scope ──
+    let installedMap: Record<string, string> = {};
+    try {
+        ctx.inject?.(["pluginManager"], (child) => {
+            child.effect?.(() => {
+                let timer: ReturnType<typeof setInterval> | undefined;
+                const refresh = async (): Promise<void> => {
+                    try {
+                        const bundles = (await child.pluginManager?.listBundles?.()) ?? [];
+                        const map: Record<string, string> = {};
+                        for (const bundle of bundles) {
+                            if (bundle && typeof bundle.name === "string" && bundle.installed) map[bundle.name] = String(bundle.version ?? "");
+                        }
+                        installedMap = map;
+                    } catch { /* keep the previous result */ }
+                };
+                void refresh();
+                timer = setInterval(() => void refresh(), 30_000);
+                if (typeof timer === "object" && typeof timer.unref === "function") timer.unref();
+                return () => clearInterval(timer);
+            }, "billion-context: featured installed-bundles watcher");
+        });
+    } catch { /* pluginManager unavailable → no badges; the tab still works */ }
+
+    // ── aggregate: remote catalog (primary) + registered sources, deduped by
+    // package name, first-come-first-served; rich fields backfilled ──
+    const RICH_KEYS = ["author", "homepage", "category", "icon", "screenshots", "stars", "downloads"] as const;
+    const aggregate = async (): Promise<unknown> => {
+        const remoteRaw = Array.isArray(remoteCache.doc?.entries) ? (remoteCache.doc?.entries as Array<Record<string, unknown>>) : [];
+        const remoteIndex = new Map<string, Record<string, unknown>>();
+        for (const raw of remoteRaw) {
+            const pkg = String(raw?.package ?? raw?.name ?? "").trim();
+            if (pkg && !remoteIndex.has(pkg)) remoteIndex.set(pkg, raw);
+        }
+        const seen = new Set<string>();
+        const entries: FeaturedPluginEntry[] = [];
+        const push = (normalized: FeaturedPluginEntry | null): void => {
+            if (!normalized || seen.has(normalized.package)) return;
+            seen.add(normalized.package);
+            const rich = remoteIndex.get(normalized.package);
+            if (rich && normalized.source !== "plugins.json") {
+                for (const key of RICH_KEYS) {
+                    if ((normalized as Record<string, unknown>)[key] === undefined && rich[key] !== undefined) {
+                        (normalized as Record<string, unknown>)[key] = rich[key];
+                    }
+                }
+            }
+            entries.push(normalized);
+        };
+        for (const raw of remoteRaw) push(featuredNormalizeEntry(raw, "plugins.json"));
+        for (const src of registry.list()) {
+            for (const entry of src.entries) push(entry);
+        }
+        return {
+            entries,
+            sources: registry.list().map((s) => ({ id: s.id, title: s.title, count: s.entries.length })),
+            installed: installedMap,
+            remote: remoteCache.doc ? { fetchedAt: new Date(remoteCache.at).toISOString(), count: entries.length } : null,
+        };
+    };
+
+    // ── aggregate route (duplicate registration throws → catch silently; an
+    // earlier featured-integrated plugin already owns it) ──
+    ctx.inject?.(["webServer"], (child) => {
+        child.effect?.(() => {
+            let dispose: (() => void) | undefined;
+            try {
+                dispose = child.webServer?.register({
+                    kind: "exact",
+                    path: FEATURED_ROUTE,
+                    handler: async (req, res) => {
+                        try {
+                            const headers = (req as { headers?: Record<string, unknown> })?.headers ?? {};
+                            if (!featuredSameOrigin(req, headers)) {
+                                featuredJson(res, 403, { ok: false, error: "cross-origin request rejected" });
+                                return;
+                            }
+                            const method = (req as { method?: string })?.method;
+                            if (method !== "GET" && method !== "HEAD") {
+                                featuredJson(res, 405, { ok: false, error: "method not allowed" });
+                                return;
+                            }
+                            await fetchRemoteCatalog().catch(() => null);
+                            featuredJson(res, 200, { ok: true, data: await aggregate() });
+                        } catch (error) {
+                            featuredJson(res, 200, { ok: false, error: String((error as Error)?.message ?? error) });
+                        }
+                    },
+                });
+            } catch { /* route already registered → this side stays a data source */ }
+            return () => {
+                if (typeof dispose === "function") dispose();
+            };
+        }, "billion-context: featured route");
+    });
 }
